@@ -18,8 +18,11 @@ Issue opened ──▶ .github/workflows/issue-responder.yml
 1. **Enable Issues** on the repository (forks have Issues disabled by default:
    *Settings → General → Features → Issues*).
 2. **Add a secret** named `COPILOT_GITHUB_TOKEN` (*Settings → Secrets and variables
-   → Actions*). Use a personal access token from an account with a Copilot plan.
-3. *(Recommended for the first rollout)* add a repository **variable**
+   → Actions*). Use a **fine-grained** personal access token
+   (<https://github.com/settings/personal-access-tokens/new>) from an account with a
+   Copilot plan, with the account permission **Copilot Requests** set to read-only.
+   Classic tokens (`ghp_…`) are rejected by the Copilot CLI.
+3. *(Recommended for the first rollout)* add a repository **variable** (not a secret)
    `ISSUE_RESPONDER_DRY_RUN` = `true`. Automatic runs then write the draft to the
    job summary instead of commenting.
 4. Test from *Actions → Issue Responder → Run workflow* with an issue number
