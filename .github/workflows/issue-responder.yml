@@ -84,6 +84,7 @@ jobs:
             echo "---"
             echo "> 🤖 _Automated first response generated from the Copilot Studio Kit documentation and past resolved issues. It may be incomplete or wrong — a maintainer will follow up._"
           } > comment.md
+          cat comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post reply
