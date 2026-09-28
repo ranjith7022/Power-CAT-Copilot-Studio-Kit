@@ -87,12 +87,7 @@ jobs:
         env:
           RESPONSE_FILE: ${{ steps.inference.outputs.response-file }}
         run: |
-          {
-            cat "$RESPONSE_FILE"
-            echo ""
-            echo "---"
-            echo "<sub>🤖 This is an automated first response based on the Copilot Agent Kit documentation and past issues, so it may be incomplete. A maintainer will follow up.</sub>"
-          } > comment.md
+          node .github/issue-responder/finalize.js
           cat comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
