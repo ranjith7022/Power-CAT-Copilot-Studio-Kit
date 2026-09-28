@@ -325,6 +325,7 @@ async function findSimilarIssues({ token, repos, issue, issueRepo }) {
     for (const item of await searchIssues(token, repos, q, sort)) {
       const repo = repoOf(item);
       if (repo.toLowerCase() === issueRepo.toLowerCase() && item.number === issue.number) continue;
+      if (item.title.trim() === issue.title.trim() && cleanBody(item.body) === cleanBody(issue.body)) continue; // a copy of this issue
       if (item.state_reason === "not_planned" && (item.comments ?? 0) === 0) continue;
       candidates.set(`${repo}#${item.number}`, { ...item, repo });
     }
@@ -398,7 +399,8 @@ async function recentIssuesDigest({ token, repos, issue, issueRepo, exclude }) {
     .filter((it) => {
       const ref = `${it.repo}#${it.number}`;
       const self = it.repo.toLowerCase() === issueRepo.toLowerCase() && it.number === issue.number;
-      return !self && !exclude.has(ref);
+      const copy = it.title.trim() === issue.title.trim() && cleanBody(it.body) === cleanBody(issue.body);
+      return !self && !copy && !exclude.has(ref);
     });
 
   const digest = [];

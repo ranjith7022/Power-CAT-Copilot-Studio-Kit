@@ -60,6 +60,24 @@ function main() {
   if (removed.length) console.log(`Removed ${removed.length} unverified link(s):\n  ${removed.join("\n  ")}`);
   else console.log("All links verified.");
 
+  // A github.com link to an issue/PR in another repo adds a "mentioned this"
+  // entry to that issue's timeline (e.g. a fork's bot pinging upstream issues).
+  // redirect.github.com opens the same page without creating the backlink.
+  let rerouted = 0;
+  body = body.replace(
+    /https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/(issues|pull)\/(\d+)/gi,
+    (m, linkRepo, kind, num) => {
+      if (linkRepo.toLowerCase() === String(repo).toLowerCase()) return m;
+      rerouted++;
+      return `https://redirect.github.com/${linkRepo}/${kind}/${num}`;
+    }
+  );
+  // "owner/repo#123" shorthand also creates backlinks; keep it as plain text.
+  body = body.replace(/(^|[^\w/`[])([\w.-]+\/[\w.-]+)#(\d+)\b/g, (m, lead, linkRepo, num) =>
+    linkRepo.toLowerCase() === String(repo).toLowerCase() ? m : `${lead}\`${linkRepo}#${num}\``
+  );
+  if (rerouted) console.log(`Rerouted ${rerouted} cross-repo link(s) to avoid backlinks.`);
+
   body = `${body}\n\n---\n${FOOTER}\n`;
   fs.writeFileSync(process.env.OUT_FILE || "comment.md", body);
 }
