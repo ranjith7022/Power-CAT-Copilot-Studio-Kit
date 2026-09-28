@@ -13,11 +13,16 @@ const path = require("path");
 const API_ROOT = "https://api.github.com";
 
 /* Limits to keep prompts (and rate limits) under control */
-const MAX_TOTAL_DOC_CHARS = 60_000;
+const MAX_TOTAL_DOC_CHARS = 40_000;
 const MAX_CHUNK_CHARS = 4_000;
-const MAX_SIMILAR_ISSUES = 5;
-const MAX_COMMENTS_PER_ISSUE = 3;
-const KEYWORD_ATTEMPTS = [6, 3, 1]; // progressively narrower searches
+const MAX_SIMILAR_ISSUES = 6;
+const MAX_CANDIDATES = 20; // per search query, before local re-ranking
+const MAX_COMMENTS_PER_ISSUE = 4;
+const MAX_COMMENT_CHARS = 1_800;
+const MIN_SIMILARITY = 4; // drops weak one-word matches
+const RECENT_DAYS = 60;
+const MAX_RECENT_ISSUES = 30;
+const RECENT_ANSWER_CHARS = 500;
 
 /* ------------------------------------------------------------------ */
 /* Shared helpers                                                     */
@@ -35,6 +40,19 @@ function ghHeaders(token) {
 function truncate(text, maxChars) {
   const clean = String(text ?? "");
   return clean.length <= maxChars ? clean : clean.slice(0, maxChars) + "\n…[truncated]";
+}
+
+/** fetch() with a few retries for transient network errors and 5xx responses. */
+async function fetchWithRetry(url, options, attempts = 3) {
+  for (let i = 1; ; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.status < 500 || i >= attempts) return res;
+    } catch (err) {
+      if (i >= attempts) throw err;
+    }
+    await new Promise((r) => setTimeout(r, 1000 * i));
+  }
 }
 
 const STOPWORDS = new Set([
@@ -225,67 +243,183 @@ async function collectDocs(repoRoot, issueText, repo) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Previously resolved issues                                         */
+/* Past issues (closed + open) and how maintainers answered them      */
 /* ------------------------------------------------------------------ */
 
-async function searchClosedIssues(token, repo, query, excludeNumber) {
-  const params = new URLSearchParams({
-    q: `repo:${repo} is:issue is:closed ${query}`,
-    per_page: String(MAX_SIMILAR_ISSUES + 1),
-  });
-  const res = await fetch(`${API_ROOT}/search/issues?${params}`, {
-    headers: ghHeaders(token),
-  });
-  if (!res.ok) throw new Error(`Issue search failed (${res.status}).`);
-  const data = await res.json();
-  return (data.items ?? [])
-    .filter((item) => item.number !== excludeNumber)
-    .slice(0, MAX_SIMILAR_ISSUES);
+const MAINTAINER_ROLES = new Set(["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]);
+
+/** Removes screenshots/HTML noise that wastes prompt space. */
+function cleanBody(text) {
+  return String(text ?? "")
+    .replace(/<img[^>]*>/gi, "[screenshot]")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "[screenshot]")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
-async function fetchLastComments(token, repo, issueNumber) {
-  const res = await fetch(
-    `${API_ROOT}/repos/${repo}/issues/${issueNumber}/comments?per_page=100`,
-    { headers: ghHeaders(token) }
-  );
+async function searchIssues(token, repos, query, sort) {
+  const scope = repos.map((r) => `repo:${r}`).join(" ");
+  const params = new URLSearchParams({
+    q: `${scope} is:issue ${query}`,
+    per_page: String(MAX_CANDIDATES),
+  });
+  if (sort) params.set("sort", sort);
+  const res = await fetchWithRetry(`${API_ROOT}/search/issues?${params}`, {
+    headers: ghHeaders(token),
+  });
+  if (!res.ok) {
+    console.log(`  ! issue search failed (${res.status}) for "${query}"`);
+    return [];
+  }
+  return (await res.json()).items ?? [];
+}
+
+function repoOf(item) {
+  return item.repository_url.replace(`${API_ROOT}/repos/`, "");
+}
+
+/** Maintainer answers plus the reporter's own follow-ups (often "this fixed it"). */
+async function fetchUsefulComments(token, repo, item) {
+  const res = await fetchWithRetry(`${API_ROOT}/repos/${repo}/issues/${item.number}/comments?per_page=100`, {
+    headers: ghHeaders(token),
+  });
   if (!res.ok) return [];
-  const all = await res.json();
-  return all.slice(-MAX_COMMENTS_PER_ISSUE).map((c) => ({
-    user: c.user?.login ?? "unknown",
-    body: truncate(c.body, 1200),
-  }));
+  const reporter = item.user?.login;
+  return (await res.json())
+    .filter((c) => c.user?.type !== "Bot" && !/automated first response/i.test(String(c.body)))
+    .map((c) => ({
+      user: c.user?.login ?? "unknown",
+      role: MAINTAINER_ROLES.has(c.author_association)
+        ? "maintainer"
+        : c.user?.login === reporter
+          ? "reporter"
+          : "community",
+      body: truncate(cleanBody(c.body), MAX_COMMENT_CHARS),
+    }))
+    .filter((c) => c.role !== "community")
+    .slice(-MAX_COMMENTS_PER_ISSUE);
 }
 
 /**
- * Finds closed issues similar to the given one. Tries progressively shorter
- * keyword lists so we still get results when keywords don't co-occur.
+ * Finds past issues similar to the given one across `repos`. Runs a few broad
+ * searches, then re-ranks candidates locally by keyword overlap (title matches
+ * weighted higher), so one unusual word in the new issue can't sink recall.
  */
-async function findSimilarIssues({ token, repo, issue }) {
-  const keywords = extractKeywords(`${issue.title} ${issue.body}`, 10);
+async function findSimilarIssues({ token, repos, issue, issueRepo }) {
+  const titleWords = extractKeywords(issue.title, 6);
+  const allWords = extractKeywords(`${issue.title} ${cleanBody(issue.body)}`, 12);
+  // Best-match searches find the closest wording; "updated" searches surface
+  // recent known issues whose maintainer answers reflect the current state.
+  const searches = [
+    [titleWords.slice(0, 3).join(" ")],
+    [titleWords.slice(0, 2).join(" ")],
+    [allWords.slice(0, 2).join(" ")],
+    ...titleWords.slice(0, 3).map((w) => [`${w} in:title`]),
+    [titleWords.slice(0, 2).join(" "), "updated"],
+    [`${titleWords[0] || ""} in:title`, "updated"],
+  ].filter(([q], i, arr) => q.replace("in:title", "").trim() && arr.findIndex((a) => a.join() === arr[i].join()) === i);
 
-  for (const count of KEYWORD_ATTEMPTS) {
-    const words = keywords.slice(0, count);
-    if (words.length === 0) break;
-
-    const items = await searchClosedIssues(token, repo, words.join(" "), issue.number);
-    if (items.length === 0) continue;
-
-    const detailed = [];
-    for (const item of items) {
-      detailed.push({
-        number: item.number,
-        title: item.title,
-        url: item.html_url,
-        stateReason: item.state_reason,
-        body: truncate(item.body, 1500),
-        comments: await fetchLastComments(token, repo, item.number),
-      });
+  const candidates = new Map();
+  for (const [q, sort] of searches) {
+    for (const item of await searchIssues(token, repos, q, sort)) {
+      const repo = repoOf(item);
+      if (repo.toLowerCase() === issueRepo.toLowerCase() && item.number === issue.number) continue;
+      if (item.state_reason === "not_planned" && (item.comments ?? 0) === 0) continue;
+      candidates.set(`${repo}#${item.number}`, { ...item, repo });
     }
-    console.log(`  → matched with keywords: "${words.join(" ")}"`);
-    return detailed;
   }
+  if (candidates.size === 0) return [];
 
-  return [];
+  const list = [...candidates.values()];
+  const docs = list.map((it) => ({
+    title: new Set(tokenize(it.title)),
+    body: new Set(tokenize(cleanBody(it.body).slice(0, 4000))),
+  }));
+  const df = new Map();
+  for (const d of docs) for (const w of new Set([...d.title, ...d.body])) df.set(w, (df.get(w) || 0) + 1);
+  const n = list.length;
+  const scored = list
+    .map((it, i) => {
+      let score = 0;
+      for (const kw of allWords) {
+        const idf = Math.log((n + 1) / (1 + (df.get(kw) || 0))) + 0.5;
+        if (docs[i].title.has(kw)) score += 3 * idf;
+        else if (docs[i].body.has(kw)) score += idf;
+      }
+      if ((it.comments ?? 0) > 0) score *= 1.2; // answered issues are more useful
+      const ageDays = (Date.now() - Date.parse(it.updated_at)) / 86_400_000;
+      score *= 1 + 0.6 * Math.exp(-ageDays / 60); // prefer the current state of things
+      return { it, score };
+    })
+    .filter((s) => s.score >= MIN_SIMILARITY)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_SIMILAR_ISSUES);
+
+  const detailed = [];
+  for (const { it, score } of scored) {
+    detailed.push({
+      ref: `${it.repo}#${it.number}`,
+      title: it.title,
+      url: it.html_url,
+      state: it.state === "open" ? "open" : `closed: ${it.state_reason || "completed"}`,
+      score: Math.round(score * 10) / 10,
+      body: truncate(cleanBody(it.body), 1200),
+      comments: await fetchUsefulComments(token, it.repo, it),
+    });
+  }
+  console.log(
+    `  → ${candidates.size} candidates from ${searches.length} searches; top: ` +
+      detailed.map((d) => `${d.ref}(${d.score})`).join(", ")
+  );
+  return detailed;
 }
 
-module.exports = { ghHeaders, collectDocs, findSimilarIssues };
+/**
+ * One-line summaries of recently active, maintainer-answered issues. Keyword
+ * search misses issues that share a root cause but not wording (e.g. "dormant
+ * agents wrong" vs "usage API returns 403"); the model can connect those itself.
+ */
+async function recentIssuesDigest({ token, repos, issue, issueRepo, exclude }) {
+  const since = new Date(Date.now() - RECENT_DAYS * 86_400_000).toISOString().slice(0, 10);
+  const scope = repos.map((r) => `repo:${r}`).join(" ");
+  const params = new URLSearchParams({
+    q: `${scope} is:issue comments:>0 updated:>=${since}`,
+    sort: "updated",
+    per_page: String(MAX_RECENT_ISSUES + 10),
+  });
+  const res = await fetchWithRetry(`${API_ROOT}/search/issues?${params}`, { headers: ghHeaders(token) });
+  if (!res.ok) {
+    console.log(`  ! recent-issue search failed (${res.status})`);
+    return [];
+  }
+  const items = ((await res.json()).items ?? [])
+    .map((it) => ({ ...it, repo: repoOf(it) }))
+    .filter((it) => {
+      const ref = `${it.repo}#${it.number}`;
+      const self = it.repo.toLowerCase() === issueRepo.toLowerCase() && it.number === issue.number;
+      return !self && !exclude.has(ref);
+    });
+
+  const digest = [];
+  for (let i = 0; i < items.length && digest.length < MAX_RECENT_ISSUES; i += 8) {
+    const batch = await Promise.all(
+      items.slice(i, i + 8).map(async (it) => {
+        const comments = await fetchUsefulComments(token, it.repo, it);
+        const answers = comments.filter((c) => c.role === "maintainer").slice(-2);
+        if (answers.length === 0) return null;
+        const summary = answers
+          .map((c) => c.body.replace(/\s+/g, " ").slice(0, RECENT_ANSWER_CHARS / answers.length))
+          .join(" … ");
+        const state = it.state === "open" ? "open" : "closed";
+        return `- ${it.html_url} [${state}] "${it.title}" — latest maintainer replies: ${summary}`;
+      })
+    );
+    digest.push(...batch.filter(Boolean));
+  }
+  const result = digest.slice(0, MAX_RECENT_ISSUES);
+  console.log(`  → ${result.length} recent maintainer-answered issue(s) since ${since}`);
+  return result;
+}
+
+module.exports = { ghHeaders, collectDocs, findSimilarIssues, recentIssuesDigest, cleanBody };

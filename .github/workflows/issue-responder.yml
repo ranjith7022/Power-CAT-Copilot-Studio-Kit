@@ -19,17 +19,22 @@ on:
         type: boolean
         default: true
       force:
-        description: "Answer even if the issue already has comments"
+        description: "Answer even if the issue is closed or already has comments"
         required: false
         type: boolean
         default: false
+      issue_repo:
+        description: "Replay an issue from another repo (owner/name). Always a dry run."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read # read the checked-out documentation files
   issues: write # post comments on issues
 
 concurrency:
-  group: issue-responder-${{ github.event.issue.number || inputs.issue_number }}
+  group: issue-responder-${{ inputs.issue_repo || github.repository }}-${{ github.event.issue.number || inputs.issue_number }}
   cancel-in-progress: false
 
 jobs:
@@ -40,8 +45,12 @@ jobs:
     env:
       ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
       REPO: ${{ github.repository }}
+      ISSUE_REPO: ${{ inputs.issue_repo || github.repository }}
+      # Past issues searched for answers; the upstream repo has the full history.
+      KNOWLEDGE_REPOS: ${{ github.repository }},microsoft/Power-CAT-Copilot-Studio-Kit
       # Repo variable ISSUE_RESPONDER_DRY_RUN=true keeps automatic runs log-only.
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false') || (vars.ISSUE_RESPONDER_DRY_RUN == 'true' && 'true' || 'false') }}
+      # Replays of another repo's issues are never posted.
+      DRY_RUN: ${{ (inputs.issue_repo != '' && inputs.issue_repo != github.repository) && 'true' || github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false') || (vars.ISSUE_RESPONDER_DRY_RUN == 'true' && 'true' || 'false') }}
     steps:
       - name: Check out repository (documentation source)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -51,7 +60,7 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Gather context (docs + resolved issues)
+      - name: Gather context (docs + past issues)
         id: gather
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -82,7 +91,7 @@ jobs:
             cat "$RESPONSE_FILE"
             echo ""
             echo "---"
-            echo "> 🤖 _Automated first response generated from the Copilot Studio Kit documentation and past resolved issues. It may be incomplete or wrong — a maintainer will follow up._"
+            echo "<sub>🤖 This is an automated first response based on the Copilot Agent Kit documentation and past issues, so it may be incomplete. A maintainer will follow up.</sub>"
           } > comment.md
           cat comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
